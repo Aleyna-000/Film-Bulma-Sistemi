@@ -1,0 +1,240 @@
+====================================
+KONSOL TABANLI UYGULAMA (main.py)
+====================================
+import json
+import os
+from neo4j import GraphDatabase
+from neo4j.exceptions import ServiceUnavailable
+
+class MovieApp:
+    def __init__(self, uri, user, password):
+        try:
+            self.driver = GraphDatabase.driver(uri, auth=(user, password))
+            self.driver.verify_connectivity()
+            print(">>> Neo4j Bağlantısı Başarılı!")
+            self.last_search_results = []
+            self.selected_movie = None
+        except Exception:
+            print("\n[!] HATA: Neo4j sunucusuna bağlanılamadı!")
+            print("Lütfen Neo4j Desktop uygulamasının açık olduğundan emin olun.")
+            self.driver = None
+            self.last_search_results = []
+            self.selected_movie = None
+
+    def close(self):
+        if self.driver:
+            self.driver.close()
+
+    def menu(self):
+        if not self.driver:
+            return
+
+        while True:
+            print("\n" + "=" * 30)
+            print("   MOVIEGRAPH PY SİSTEMİ")
+            print("=" * 30)
+            print("1) Film Ara")
+            print("2) Film Detayı Göster")
+            print("3) Seçili Film için graph.json Oluştur")
+            print("4) Çıkış")
+
+            secim = input("Seçiminiz: ")
+
+            if secim == "1":
+                self.film_ara()
+            elif secim == "2":
+                self.film_detay()
+            elif secim == "3":
+                self.graph_json_olustur()
+            elif secim == "4":
+                print("Programdan çıkılıyor...")
+                break
+            else:
+                print("Hata: Geçersiz seçim!")
+
+    def film_ara(self):
+        search_term = input("Aranacak film: ").strip()
+        if not search_term:
+            print("Hata: Boş arama yapamazsınız!")
+            return
+
+        query = """
+        MATCH (m:Movie)
+        WHERE toLower(m.title) CONTAINS toLower($title)
+        RETURN m.title AS title, m.released AS year, elementId(m) AS id
+        """
+
+        try:
+            with self.driver.session() as session:
+                results = session.run(query, title=search_term)
+                self.last_search_results = [record for record in results]
+
+            if not self.last_search_results:
+                print("Sonuç bulunamadı")
+            else:
+                print("\nBulunan Filmler:")
+                for idx, movie in enumerate(self.last_search_results, 1):
+                    print(f"{idx}. {movie['title']} ({movie['year']})")
+        except ServiceUnavailable:
+            print("Hata: Veritabanı bağlantısı koptu!")
+
+    def film_detay(self):
+        if not self.last_search_results:
+            print("Hata: Önce arama yapın!")
+            return
+
+        try:
+            secilen_idx = input("Film numarası: ")
+            idx = int(secilen_idx) - 1
+
+            if 0 <= idx < len(self.last_search_results):
+                self.selected_movie = self.last_search_results[idx]
+
+                query = """
+                MATCH (m:Movie)
+                WHERE elementId(m) = $m_id
+                OPTIONAL MATCH (p1:Person)-[:DIRECTED]->(m)
+                WITH m, collect(DISTINCT p1.name) AS directors
+                OPTIONAL MATCH (p2:Person)-[:ACTED_IN]->(m)
+                RETURN m.title AS title,
+                       m.released AS year,
+                       m.tagline AS tagline,
+                       directors,
+                       collect(DISTINCT p2.name) AS actors
+                """
+
+                with self.driver.session() as session:
+                    res = session.run(query, m_id=self.selected_movie["id"]).single()
+
+                print("\n--- FİLM DETAYI ---")
+                print(f"AD: {res['title']}")
+                print(f"YIL: {res['year']}")
+                print(f"TAGLINE: {res['tagline'] or 'Yok'}")
+                print(f"YÖNETMEN: {', '.join(res['directors']) if res['directors'] else 'Bilinmiyor'}")
+                print(f"OYUNCULAR: {', '.join(res['actors'][:5]) if res['actors'] else 'Bilinmiyor'}")
+            else:
+                print("Hata: Geçersiz numara!")
+
+        except ValueError:
+            print("Hata: Lütfen geçerli bir sayı girin!")
+        except ServiceUnavailable:
+            print("Hata: Veritabanı bağlantısı koptu!")
+
+    def graph_json_olustur(self):
+        if not self.selected_movie:
+            print("Hata: Önce film seçin (Seçenek 2)!")
+            return
+
+        os.makedirs("exports", exist_ok=True)
+
+        query = """
+        MATCH (m:Movie)
+        WHERE elementId(m) = $m_id
+        MATCH (p:Person)-[r:ACTED_IN|DIRECTED]->(m)
+        RETURN m, p, type(r) AS rel_type
+        """
+
+        nodes = []
+        links = []
+        seen = set()
+
+        try:
+            with self.driver.session() as session:
+                results = session.run(query, m_id=self.selected_movie["id"])
+                for record in results:
+                    m = record["m"]
+                    p = record["p"]
+
+                    if m.element_id not in seen:
+                        nodes.append({"id": m.element_id, "label": "Movie", "title": m["title"]})
+                        seen.add(m.element_id)
+
+                    if p.element_id not in seen:
+                        nodes.append({"id": p.element_id, "label": "Person", "name": p["name"]})
+                        seen.add(p.element_id)
+
+                    links.append({
+                        "source": p.element_id,
+                        "target": m.element_id,
+                        "type": record["rel_type"]
+                    })
+
+            with open("exports/graph.json", "w", encoding="utf-8") as f:
+                json.dump({"nodes": nodes, "links": links}, f, ensure_ascii=False, indent=4)
+
+            print("exports/graph.json oluşturuldu")
+        except ServiceUnavailable:
+            print("Hata: Veritabanı bağlantısı koptu!")
+
+if __name__ == "__main__":
+    app = MovieApp("bolt://localhost:7687", "neo4j", "*****")
+    app.menu()
+    app.close()
+
+
+====================================
+GRAF VERİ ÇIKTISI (graph.json)
+====================================
+
+
+{
+    "nodes": [
+        {
+            "id": "4:a8f3a15c-5194-48b3-a67c-1da7e85e9215:52",
+            "label": "Movie",
+            "title": "As Good as It Gets"
+        },
+        {
+            "id": "4:a8f3a15c-5194-48b3-a67c-1da7e85e9215:17",
+            "label": "Person",
+            "name": "Jack Nicholson"
+        },
+        {
+            "id": "4:a8f3a15c-5194-48b3-a67c-1da7e85e9215:22",
+            "label": "Person",
+            "name": "Cuba Gooding Jr."
+        },
+        {
+            "id": "4:a8f3a15c-5194-48b3-a67c-1da7e85e9215:53",
+            "label": "Person",
+            "name": "Helen Hunt"
+        },
+        {
+            "id": "4:a8f3a15c-5194-48b3-a67c-1da7e85e9215:54",
+            "label": "Person",
+            "name": "Greg Kinnear"
+        },
+        {
+            "id": "4:a8f3a15c-5194-48b3-a67c-1da7e85e9215:55",
+            "label": "Person",
+            "name": "James L. Brooks"
+        }
+    ],
+    "links": [
+        {
+            "source": "4:a8f3a15c-5194-48b3-a67c-1da7e85e9215:17",
+            "target": "4:a8f3a15c-5194-48b3-a67c-1da7e85e9215:52",
+            "type": "ACTED_IN"
+        },
+        {
+            "source": "4:a8f3a15c-5194-48b3-a67c-1da7e85e9215:22",
+            "target": "4:a8f3a15c-5194-48b3-a67c-1da7e85e9215:52",
+            "type": "ACTED_IN"
+        },
+        {
+            "source": "4:a8f3a15c-5194-48b3-a67c-1da7e85e9215:53",
+            "target": "4:a8f3a15c-5194-48b3-a67c-1da7e85e9215:52",
+            "type": "ACTED_IN"
+        },
+        {
+            "source": "4:a8f3a15c-5194-48b3-a67c-1da7e85e9215:54",
+            "target": "4:a8f3a15c-5194-48b3-a67c-1da7e85e9215:52",
+            "type": "ACTED_IN"
+        },
+        {
+            "source": "4:a8f3a15c-5194-48b3-a67c-1da7e85e9215:55",
+            "target": "4:a8f3a15c-5194-48b3-a67c-1da7e85e9215:52",
+            "type": "DIRECTED"
+        }
+    ]
+}
